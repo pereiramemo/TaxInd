@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# Test / tooling caches
+.pytest_cache/
+
+# Module outputs
+out/
