@@ -236,8 +236,8 @@ cleaning without prompts (checksum mismatch on the input → hard error).
 | Action | Meaning |
 |---|---|
 | `set <value>` | manually modify a value |
-| `drop_row` | remove a sample |
-| `drop_col` | remove a feature |
+| `drop-row` | remove a sample (drops every occurrence of a duplicated ID) |
+| `drop-col` | remove a feature (drops pandas-renamed variants too) |
 | `rename <new_id>` | resolve a duplicated ID |
 | `coerce` | convert type (e.g. `"3"` → `3`) |
 | `keep` | **reject** the invalidation — accept the data as is |
@@ -251,9 +251,9 @@ cleaning without prompts (checksum mismatch on the input → hard error).
   "input_checksum": "sha256:...",
   "generated": "2026-11-11T12:00:00",
   "decisions": [
-    {"issue": "NEGATIVE_VALUE", "target": {"row": "S03", "col": "ASV-12"}, "action": "set", "value": 1},
-    {"issue": "DUPLICATE_ROW_ID", "target": {"row": "S07"}, "action": "drop_row"},
-    {"issue": "EMPTY_FEATURE", "target": {"col": "ACGTTA..."}, "action": "keep"}
+    {"issue": "NEGATIVE_VALUE", "target": {"row": "S03", "column": "ASV-12"}, "action": "set", "value": 1},
+    {"issue": "DUPLICATE_ROW_ID", "target": {"row": "S07"}, "action": "drop-row"},
+    {"issue": "EMPTY_FEATURE", "target": {"column": "ACGTTA..."}, "action": "keep"}
   ]
 }
 ```
@@ -364,8 +364,9 @@ output feeds abundance-based analyses on compositional data.
       type/unit detection, issue checks, optional metadata cross-check,
       reports. *(implemented; QA suite `tests/test_module1.py` — 17 tests
       driven by `data/examples/asv_abundance_table.csv`, all passing)*
-- [ ] **Stage 2:** `clean` subcommand — interactive session, decisions file,
-      actions, change log, post-clean report.
+- [x] **Stage 2:** `clean` subcommand — interactive session, decisions file,
+      actions, change log, post-clean report. *(implemented; QA suite
+      extended to 24 tests, all passing)*
 - [ ] **Stage 3:** `rarefy` subcommand — rarefaction + relative/binary
       transformations + report.
 - [ ] **Stage 4:** `run` subcommand, consolidated report, tests, README update.

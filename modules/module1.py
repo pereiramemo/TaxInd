@@ -1,28 +1,40 @@
 #!/usr/bin/env python3
 """
-module1.py - Stage 1 (validate): import, validation and diagnostics.
+module1.py - TaxInd module 1: import, validation and cleaning of diversity
+matrices (preprocessing stage of the TaxInd pipeline).
 
-TaxInd pipeline, module 1 (preprocessing). This stage reads a raw biological
-diversity matrix (ASV/OTU/taxa abundance table in CSV, TSV or Excel format),
-diagnoses its structure and contents, and writes a normalized matrix plus a
-validation report that feeds Stage 2 (`clean`).
+Implemented stages:
 
-Detected properties:
-  - structure   : wide (samples x taxa) vs long (tidy) format
-  - orientation : samples as rows (standard) or as columns (auto-transposed)
-  - data type   : counts, binary (presence/absence) or relative abundance
-  - unit        : ASV (sequence identifiers) vs OTU (cluster identifiers)
+  validate (Stage 1)
+      Reads a raw biological diversity matrix (ASV/OTU/taxa abundance table
+      in CSV, TSV or Excel format), diagnoses its structure and contents,
+      and writes a normalized matrix plus a validation report that feeds
+      Stage 2.
 
-Validation checks (typed, severity-classified issues):
-  null values, negative values, non-numeric values, duplicated row/column
-  identifiers, empty samples/features, inconsistent types, already-rarefied
-  matrices, low-confidence orientation and, optionally, sample-name
-  mismatches against a metadata table.
+        Detected properties:
+          - structure   : wide (samples x taxa) vs long (tidy) format
+          - orientation : samples as rows (standard) or columns (transposed)
+          - data type   : counts, binary (presence/absence), relative
+          - unit        : ASV (sequences) vs OTU (cluster identifiers)
 
-Outputs (written to --outdir, default `out/`):
-  matrix_step1.csv         normalized matrix (wide, samples as rows, numeric)
-  validation_report.json   machine-readable report (properties + issues)
-  validation_report.md     human-readable report
+        Validation checks (typed, severity-classified issues): null values,
+        negative values, non-numeric values, duplicated identifiers, empty
+        samples/features, inconsistent types, already-rarefied matrices,
+        low-confidence orientation and, optionally, sample-name mismatches
+        against a metadata table.
+
+  clean (Stage 2)
+      Reviews the issues detected by Stage 1 and corrects the matrix.
+      Interactive terminal session (default) or replay of a saved decisions
+      file (--decisions). Actions: set, drop-row, drop-col, rename, coerce,
+      keep (accept as is), ignore (postpone). Every decision is recorded
+      (decisions.json + change_log.json) and the cleaned matrix is
+      re-validated (postclean report).
+
+Outputs (written to --outdir):
+  Stage 1: matrix_step1.csv, validation_report.{json,md}
+  Stage 2: matrix_clean.csv, decisions.json, change_log.json,
+           postclean_report.md
 
 Assumptions:
   - The input table has a header row.
@@ -35,9 +47,9 @@ Exit codes:
 
 Usage:
   python modules/module1.py validate -i INPUT [-o OUTDIR] [options]
+  python modules/module1.py clean -i MATRIX [--decisions FILE] [options]
 
-Stages 2 (`clean`), 3 (`rarefy`) and 4 (`run`) are planned - see
-docs/plan_module1.md.
+Stages 3 (`rarefy`) and 4 (`run`) are planned - see docs/plan_module1.md.
 """
 
 ###############################################################################
@@ -49,6 +61,7 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -922,7 +935,770 @@ def crosscheck_metadata(matrix: pd.DataFrame, metadata_path: str, id_col: int,
 
 
 ###############################################################################
-# 8. CLI
+# 8. Cleaning (Stage 2)
+###############################################################################
+
+ACTIONS = {"set", "drop-row", "drop-col", "rename", "coerce", "keep", "ignore"}
+BULK_ACTIONS = {"set", "drop-row", "drop-col", "coerce", "keep", "ignore"}
+ACTION_ALIASES = {
+    "s": "set", "dr": "drop-row", "dc": "drop-col",
+    "rn": "rename", "c": "coerce", "k": "keep", "i": "ignore",
+}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _issue_target_ids(issue: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """(row, column) identifiers an issue refers to; (None, None) if n/a."""
+    axis = issue.get("axis")
+    target = issue.get("target")
+    if isinstance(target, dict):
+        row = target.get("row")
+        column = target.get("column", target.get("col"))
+        return (str(row) if row is not None else None,
+                str(column) if column is not None else None)
+    if axis == "row":
+        return (str(target) if target is not None else None, None)
+    if axis == "column":
+        return None, (str(target) if target is not None else None)
+    return None, None
+
+
+def _decision_target(issue: Dict[str, Any]) -> Dict[str, str]:
+    """Structured decision target derived from a report issue."""
+    row, column = _issue_target_ids(issue)
+    target: Dict[str, str] = {}
+    if row is not None:
+        target["row"] = row
+    if column is not None:
+        target["column"] = column
+    if (not target and issue.get("axis") == "metadata"
+            and issue.get("target") is not None):
+        target["id"] = str(issue["target"])
+    return target
+
+
+def _decision_key(decision: Dict[str, Any]) -> Tuple[str, str]:
+    """Stable key matching a decision to the issue it resolves."""
+    return (str(decision.get("issue")),
+            json.dumps(decision.get("target") or {}, sort_keys=True))
+
+
+def _issue_key(issue: Dict[str, Any]) -> Tuple[str, str]:
+    """Stable key of a (post-clean) issue for decision matching."""
+    return (str(issue.get("code")),
+            json.dumps(_decision_target(issue), sort_keys=True))
+
+
+def _available_actions(issue: Dict[str, Any]) -> List[str]:
+    """Actions that make sense for a given issue."""
+    axis = issue.get("axis")
+    if axis == "cell":
+        return ["set", "drop-row", "drop-col", "keep", "ignore"]
+    if axis == "row":
+        return ["drop-row", "rename", "keep", "ignore"]
+    if axis == "column":
+        return ["drop-col", "rename", "keep", "ignore"]
+    if axis == "metadata":
+        return ["keep", "ignore"]
+    if issue.get("code") == "INCONSISTENT_TYPE":
+        return ["coerce", "keep", "ignore"]
+    return ["keep", "ignore"]
+
+
+def _suggested_action(issue: Dict[str, Any],
+                      matrix: pd.DataFrame) -> Optional[str]:
+    """Default action shown for an issue (applied when the user presses enter)."""
+    code = issue.get("code")
+    if code == "NULL_VALUE":
+        row, column = _issue_target_ids(issue)
+        if row is not None and column is not None:
+            return "set 0"
+        return None
+    if code == "EMPTY_SAMPLE":
+        return "drop-row"
+    if code == "EMPTY_FEATURE":
+        return "drop-col"
+    if code == "INCONSISTENT_TYPE":
+        row, column = _issue_target_ids(issue)
+        if row is None and column is None:
+            num, _ = coerce_numeric(matrix)
+            finite = num.to_numpy(dtype=float)
+            finite = finite[np.isfinite(finite)]
+            if finite.size and bool(np.any(
+                    np.abs(finite - np.round(finite)) > INT_TOLERANCE)):
+                return "coerce"
+        return None
+    return None
+
+
+def _parse_action_tokens(tokens: List[str]) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """Parse action tokens -> (action, value, error)."""
+    if not tokens:
+        return None, None, "no action given"
+    head = ACTION_ALIASES.get(tokens[0].lower(), tokens[0].lower())
+    if head == "set":
+        if len(tokens) < 2:
+            return None, None, "usage: set <number>"
+        try:
+            number = float(tokens[1])
+        except ValueError:
+            return None, None, f"'{tokens[1]}' is not a number"
+        if not np.isfinite(number):
+            return None, None, "value must be a finite number"
+        return "set", number, None
+    if head == "rename":
+        if len(tokens) < 2:
+            return None, None, "usage: rename <new_id>"
+        return "rename", tokens[1], None
+    if head in ("drop-row", "drop-col", "coerce", "keep", "ignore"):
+        return head, None, None
+    return None, None, f"unknown action '{tokens[0]}' - type ? for help"
+
+
+def _print_clean_help() -> None:
+    print("  Actions:")
+    print("    set <number>   set a new value for the cell")
+    print("    drop-row       drop the sample row (every occurrence of the ID)")
+    print("    drop-col       drop the feature column (renamed variants too)")
+    print("    rename <id>    rename the 2nd..Nth occurrence of a duplicated ID,")
+    print("                    or the row/column itself when it is not duplicated")
+    print("    coerce         [INCONSISTENT_TYPE] round every non-integer cell")
+    print("    keep           accept the data as is (reject the invalidation)")
+    print("    ignore         postpone (the issue stays in the report)")
+    print("    all <action>   apply <action> to every remaining issue of this code")
+    print("    q              finish early (remaining issues are ignored)")
+    print("    <enter>        apply the suggested action, if any")
+
+
+def _new_decision(issue: Dict[str, Any], action: str,
+                  value: Any = None) -> Dict[str, Any]:
+    decision = {
+        "issue": issue.get("code"),
+        "target": _decision_target(issue),
+        "action": action,
+    }
+    if value is not None:
+        decision["value"] = value
+    return decision
+
+
+def interactive_clean_session(matrix: pd.DataFrame,
+                               pending: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Interactive session: the user decides what to do with each issue.
+
+    Returns the decision list (one decision per reviewed issue; issues not
+    reached because of an early quit are recorded as ignored).
+    """
+    decisions: List[Dict[str, Any]] = []
+    resolved = [False] * len(pending)
+    quit_requested = False
+    aborted_by_eof = False
+    answers = 0
+    index = 0
+
+    print("Type ? at any prompt for the list of actions.")
+    while index < len(pending) and not quit_requested:
+        if resolved[index]:
+            index += 1
+            continue
+        issue = pending[index]
+        code = issue.get("code")
+        row, column = _issue_target_ids(issue)
+        suggestion = _suggested_action(issue, matrix)
+
+        print("-" * 72)
+        header = f"({index + 1}/{len(pending)}) [{issue.get('severity')}] {code}"
+        if row is not None:
+            header += f" - row '{row}'"
+        if column is not None:
+            header += f" column '{column}'"
+        print(header)
+        if issue.get("value") is not None:
+            print(f"        value: {issue.get('value')!r}")
+        if issue.get("detail"):
+            print(f"        {issue['detail']}")
+        if suggestion:
+            print(f"        suggested: {suggestion}")
+
+        while True:
+            try:
+                line = input("  action> ").strip()
+            except EOFError:
+                aborted_by_eof = True
+                quit_requested = True
+                break
+            if not line:
+                if suggestion:
+                    line = suggestion
+                else:
+                    print("  (no suggested action for this issue - type ? for help)")
+                    continue
+            tokens = line.split()
+            first = tokens[0].lower()
+            if first in ("?", "h", "help"):
+                _print_clean_help()
+                continue
+            if first in ("q", "quit", "exit"):
+                quit_requested = True
+                break
+            if first in ("all", "a"):
+                action, value, error = _parse_action_tokens(tokens[1:])
+                if error:
+                    print(f"  {error}")
+                    continue
+                if action not in BULK_ACTIONS:
+                    print(f"  '{action}' cannot be applied in bulk")
+                    continue
+                applied = 0
+                for pos in range(index, len(pending)):
+                    if resolved[pos] or pending[pos].get("code") != code:
+                        continue
+                    if action not in _available_actions(pending[pos]):
+                        continue
+                    decisions.append(_new_decision(pending[pos], action, value))
+                    resolved[pos] = True
+                    applied += 1
+                answers += applied
+                print(f"  applied '{action}' to {applied} issue(s) of code {code}")
+                if resolved[index]:
+                    break
+                continue
+            action, value, error = _parse_action_tokens(tokens)
+            if error:
+                print(f"  {error}")
+                continue
+            if action not in _available_actions(issue):
+                print(f"  action '{action}' is not applicable here "
+                      f"(available: {', '.join(_available_actions(issue))})")
+                continue
+            if action == "set" and (row is None or column is None):
+                print("  'set' applies to cell issues only")
+                continue
+            if action == "rename":
+                new_id = str(value)
+                if new_id in matrix.index or new_id in matrix.columns:
+                    print(f"  identifier '{new_id}' already exists")
+                    continue
+            decisions.append(_new_decision(issue, action, value))
+            resolved[index] = True
+            answers += 1
+            break
+
+        if not quit_requested:
+            index += 1
+
+    if quit_requested:
+        for pos in range(len(pending)):
+            if not resolved[pos]:
+                decisions.append(_new_decision(pending[pos], "ignore"))
+                resolved[pos] = True
+
+    if aborted_by_eof and answers == 0:
+        _fail("interactive session received no input - "
+               "pass --decisions for non-interactive cleaning")
+
+    kept = sum(1 for d in decisions if d["action"] == "keep")
+    ignored = sum(1 for d in decisions if d["action"] == "ignore")
+    print("-" * 72)
+    print(f"Session finished: {len(decisions)} decision(s) "
+          f"({kept} kept, {ignored} ignored, "
+          f"{len(decisions) - kept - ignored} action(s)).")
+    return decisions
+
+
+def write_decisions_file(path: Path, matrix_path: Path,
+                         decisions: List[Dict[str, Any]]) -> None:
+    """Write the decisions file (replayable; records the input checksum)."""
+    document = {
+        "input": matrix_path.name,
+        "input_checksum": sha256_of_file(matrix_path),
+        "generated": _now(),
+        "decisions": decisions,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(document, fh, indent=2)
+        fh.write("\n")
+
+
+def load_decisions_file(path: Path, matrix_path: Path) -> List[Dict[str, Any]]:
+    """Load a decisions file; hard error on input checksum mismatch."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            document = json.load(fh)
+    except json.JSONDecodeError as exc:
+        _fail(f"could not parse decisions file '{path}': {exc}")
+    if not isinstance(document, dict) or not isinstance(document.get("decisions"), list):
+        _fail(f"malformed decisions file '{path}'")
+    checksum = document.get("input_checksum")
+    if not checksum:
+        _fail(f"decisions file '{path}' has no input checksum")
+    if checksum != sha256_of_file(matrix_path):
+        _fail(f"decisions file '{path}' was generated for a different matrix "
+              f"(file expects {checksum}, input is {sha256_of_file(matrix_path)})")
+    return document["decisions"]
+
+
+def _validate_decision_list(decisions: List[Dict[str, Any]]) -> None:
+    """Hard validation of a decisions file (must replay exactly)."""
+    for position, decision in enumerate(decisions, start=1):
+        action = decision.get("action")
+        target = decision.get("target") or {}
+        row = target.get("row")
+        column = target.get("column", target.get("col"))
+        value = decision.get("value")
+        if action not in ACTIONS:
+            _fail(f"decision #{position}: unknown action '{action}'")
+        if action == "set":
+            if row is None or column is None:
+                _fail(f"decision #{position}: 'set' needs a row and a column")
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not np.isfinite(value)):
+                _fail(f"decision #{position}: 'set' needs a finite numeric value")
+        elif action == "rename":
+            if row is None and column is None:
+                _fail(f"decision #{position}: 'rename' needs a row or a column")
+            if not value:
+                _fail(f"decision #{position}: 'rename' needs a new identifier")
+        elif action == "drop-row" and row is None:
+            _fail(f"decision #{position}: 'drop-row' needs a row")
+        elif action == "drop-col" and column is None:
+            _fail(f"decision #{position}: 'drop-col' needs a column")
+
+
+def _column_candidates(columns: pd.Index, label: str) -> List[str]:
+    """Column labels matching an ID, including pandas-renamed variants."""
+    exact: List[str] = []
+    mangled: List[str] = []
+    for column in columns:
+        column = str(column)
+        if column == label:
+            exact.append(column)
+        elif column.startswith(label + ".") and column[len(label) + 1:].isdigit():
+            mangled.append(column)
+    return exact + mangled
+
+
+def apply_decisions(matrix: pd.DataFrame, decisions: List[Dict[str, Any]]
+                    ) -> Tuple[pd.DataFrame, List[Dict[str, Any]], List[str]]:
+    """Apply decisions to a matrix.
+
+    Returns (clean_matrix, change_log, notes):
+      - change_log: one entry per matrix modification.
+      - notes: decisions that could not be applied (e.g. targets removed by
+        an earlier decision), reported in the post-clean report.
+    """
+    clean = matrix.copy()
+    change_log: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    for decision in decisions:
+        action = decision.get("action")
+        issue = str(decision.get("issue", ""))
+        target = decision.get("target") or {}
+        row_id = target.get("row")
+        column_id = target.get("column", target.get("col"))
+        value = decision.get("value")
+
+        if action in ("keep", "ignore"):
+            continue  # recorded in decisions.json; no matrix change
+
+        elif action == "set":
+            row_positions = [p for p, label in enumerate(clean.index) if label == row_id]
+            col_positions = [p for p, label in enumerate(clean.columns) if label == column_id]
+            if len(row_positions) != 1 or len(col_positions) != 1:
+                notes.append(f"set skipped: '{row_id}'/'{column_id}' "
+                             "not present or duplicated")
+                continue
+            before = clean.iat[row_positions[0], col_positions[0]]
+            clean.iat[row_positions[0], col_positions[0]] = float(value)
+            change_log.append({
+                "timestamp": _now(), "issue": issue,
+                "target": {"row": row_id, "column": column_id},
+                "action": "set",
+                "before": _json_safe(before), "after": float(value),
+            })
+
+        elif action == "drop-row":
+            occurrences = [label for label in clean.index if label == row_id]
+            if not occurrences:
+                notes.append(f"drop-row skipped: '{row_id}' not present")
+                continue
+            n_dropped = len(occurrences)
+            clean = clean.drop(index=sorted(set(occurrences)))
+            change_log.append({
+                "timestamp": _now(), "issue": issue,
+                "target": {"row": row_id}, "action": "drop-row",
+                "before": f"{n_dropped} row(s) '{row_id}'",
+                "after": f"{clean.shape[0]} sample(s) remain",
+            })
+
+        elif action == "drop-col":
+            candidates = _column_candidates(clean.columns, column_id)
+            if not candidates:
+                notes.append(f"drop-col skipped: '{column_id}' not present")
+                continue
+            clean = clean.drop(columns=candidates)
+            change_log.append({
+                "timestamp": _now(), "issue": issue,
+                "target": {"column": column_id}, "action": "drop-col",
+                "before": f"column(s) {candidates}",
+                "after": f"{clean.shape[1]} feature(s) remain",
+            })
+
+        elif action == "rename":
+            new_id = str(value)
+            if new_id in clean.index or new_id in clean.columns:
+                notes.append(f"rename skipped: '{new_id}' already exists")
+                continue
+            if row_id is not None:
+                positions = [p for p, label in enumerate(clean.index)
+                             if label == row_id]
+                if not positions:
+                    notes.append(f"rename skipped: '{row_id}' not present")
+                    continue
+                labels = list(clean.index)
+                renamed: List[str] = []
+                if len(positions) == 1:
+                    labels[positions[0]] = new_id
+                    renamed.append(new_id)
+                else:
+                    for occurrence, pos in enumerate(positions[1:], start=1):
+                        replacement = (new_id if occurrence == 1
+                                       else f"{new_id}.{occurrence}")
+                        labels[pos] = replacement
+                        renamed.append(replacement)
+                clean.index = pd.Index(labels, name=clean.index.name)
+                change_log.append({
+                    "timestamp": _now(), "issue": issue,
+                    "target": {"row": row_id}, "action": "rename",
+                    "before": row_id, "after": renamed,
+                })
+            elif column_id is not None:
+                positions = _column_candidates(clean.columns, column_id)
+                if not positions:
+                    notes.append(f"rename skipped: '{column_id}' not present")
+                    continue
+                order = [p for p, label in enumerate(clean.columns)
+                         if label in positions]
+                labels = list(clean.columns)
+                renamed = []
+                if len(order) == 1:
+                    labels[order[0]] = new_id
+                    renamed.append(new_id)
+                else:
+                    for occurrence, pos in enumerate(order[1:], start=1):
+                        replacement = (new_id if occurrence == 1
+                                       else f"{new_id}.{occurrence}")
+                        labels[pos] = replacement
+                        renamed.append(replacement)
+                clean.columns = pd.Index(labels, name=clean.columns.name)
+                change_log.append({
+                    "timestamp": _now(), "issue": issue,
+                    "target": {"column": column_id}, "action": "rename",
+                    "before": column_id, "after": renamed,
+                })
+            else:
+                notes.append("rename: missing row/column in decision")
+
+        elif action == "coerce":
+            if row_id is not None and column_id is not None:
+                row_positions = [p for p, label in enumerate(clean.index) if label == row_id]
+                col_positions = [p for p, label in enumerate(clean.columns)
+                                 if label == column_id]
+                if len(row_positions) != 1 or len(col_positions) != 1:
+                    notes.append(f"coerce skipped: '{row_id}'/'{column_id}' "
+                                  "not present or duplicated")
+                    continue
+                cell = clean.iat[row_positions[0], col_positions[0]]
+                if cell is None or (isinstance(cell, float) and np.isnan(cell)):
+                    clean.iat[row_positions[0], col_positions[0]] = 0.0
+                    change_log.append({
+                        "timestamp": _now(), "issue": issue,
+                        "target": {"row": row_id, "column": column_id},
+                        "action": "coerce", "before": None, "after": 0.0,
+                    })
+                elif isinstance(cell, float) and abs(cell - round(cell)) > INT_TOLERANCE:
+                    rounded = float(round(cell))
+                    clean.iat[row_positions[0], col_positions[0]] = rounded
+                    change_log.append({
+                        "timestamp": _now(), "issue": issue,
+                        "target": {"row": row_id, "column": column_id},
+                        "action": "coerce", "before": cell, "after": rounded,
+                    })
+                else:
+                    notes.append(f"coerce skipped at '{row_id}'/'{column_id}': "
+                                  "nothing to convert")
+            else:
+                values, _ = coerce_numeric(clean)
+                numeric = values.to_numpy(dtype=float)
+                mask = np.isfinite(numeric) & (
+                    np.abs(numeric - np.round(numeric)) > INT_TOLERANCE)
+                positions = np.nonzero(mask)
+                count = int(positions[0].size)
+                if count == 0:
+                    notes.append("coerce: no non-integer cells to round")
+                    continue
+                examples = [f"{values.index[r]} | {values.columns[c]}"
+                            for r, c in zip(positions[0][:5], positions[1][:5])]
+                clean = values.round()
+                change_log.append({
+                    "timestamp": _now(), "issue": issue,
+                    "target": {}, "action": "coerce",
+                    "before": f"{count} non-integer cell(s)",
+                    "after": "rounded to integers",
+                    "examples": examples,
+                })
+        else:
+            notes.append(f"unknown action '{action}'")
+
+    return clean, change_log, notes
+
+
+def _postclean_validation(matrix: pd.DataFrame, matrix_clean_path: Path,
+                          metadata: Optional[str] = None,
+                          metadata_id_col: int = 0) -> ValidationReport:
+    """Re-run detection and checks on the cleaned matrix."""
+    report = ValidationReport(str(matrix_clean_path),
+                               sha256_of_file(matrix_clean_path))
+    raw_matrix = matrix.copy()
+    num, null_mask = coerce_numeric(matrix)
+    data_type, data_type_ev = detect_data_type(num)
+    unit, unit_ev = detect_unit(list(matrix.columns))
+    report.properties = {
+        "structure": {"value": "wide", "confidence": 1.0,
+                      "reshaped_from_long": False, "reshape": None,
+                      "evidence": {"cleaned_matrix": True}},
+        "orientation": {"detected": "samples_rows", "confidence": 1.0,
+                        "transposed": False, "forced": False,
+                        "evidence": {"normalized_in_stage": 1}},
+        "data_type": {"value": data_type, "evidence": data_type_ev},
+        "unit": {"value": unit, "evidence": unit_ev},
+    }
+    check_cell_issues(raw_matrix, num, null_mask, report)
+    check_duplicates(matrix, report, reshaped=True, raw_header=None,
+                     samples_in_columns=False)
+    check_empty(num, report)
+    check_already_rarefied(num, report)
+    check_inconsistent_type(num, report, data_type, data_type_ev)
+    if metadata:
+        report.metadata_check = crosscheck_metadata(
+            matrix, metadata, metadata_id_col, report)
+    values = num.to_numpy(dtype=float)
+    finite_cells = int(np.isfinite(values).sum())
+    sums = num.sum(axis=1)
+    finite_sums = sums[np.isfinite(sums)]
+    report.stats = {
+        "n_samples": int(matrix.shape[0]),
+        "n_features": int(matrix.shape[1]),
+        "depth_range": ([float(finite_sums.min()), float(finite_sums.max())]
+                         if len(finite_sums) else None),
+        "sparsity": (float((values == 0).sum()) / finite_cells
+                     if finite_cells else None),
+    }
+    return report
+
+
+def write_postclean_markdown(path: Path, report: ValidationReport,
+                             statuses: List[str],
+                             decision_counts: Dict[str, int],
+                             changes_count: int, notes: List[str],
+                             before_stats: Dict[str, Any]) -> None:
+    """Human-readable post-clean report (Stage 2)."""
+
+    def short(value: Any, limit: int = 24) -> str:
+        text = str(value)
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    lines: List[str] = []
+    add = lines.append
+    add("# TaxInd module1 - Post-clean Report (Stage 2)")
+    add("")
+    add(f"- **Cleaned matrix:** `{report.input_path}`")
+    add(f"- **Checksum:** `{report.input_checksum}`")
+    add(f"- **Generated:** {report.generated}")
+    add("")
+    add("## Cleaning summary")
+    add("")
+    add("| Item | Count |")
+    add("|---|---|")
+    add(f"| Decisions | {decision_counts['total']} |")
+    add(f"| Kept (accepted as is) | {decision_counts['kept']} |")
+    add(f"| Ignored (pending) | {decision_counts['ignored']} |")
+    add(f"| Matrix changes | {changes_count} |")
+    if notes:
+        add(f"| Skipped decisions | {len(notes)} |")
+    add("")
+    add("## Matrix dimensions")
+    add("")
+    add("| | Before | After |")
+    add("|---|---|---|")
+    add(f"| Samples | {before_stats.get('n_samples')} | "
+        f"{report.stats.get('n_samples')} |")
+    add(f"| Features | {before_stats.get('n_features')} | "
+        f"{report.stats.get('n_features')} |")
+    add("")
+    add("## Re-detected properties")
+    add("")
+    add("| Property | Value | Notes |")
+    add("|---|---|---|")
+    data_type = report.properties.get("data_type", {})
+    evidence = data_type.get("evidence", {})
+    add(f"| Data type | {data_type.get('value')} | "
+        f"{evidence.get('reason') or evidence.get('values', '')} |")
+    unit = report.properties.get("unit", {})
+    add(f"| Unit | {unit.get('value')} | |")
+    add("")
+    add("## Issues after cleaning")
+    add("")
+    if not report.issues:
+        add("No issues detected in the cleaned matrix - ready for Stage 3 (`rarefy`).")
+    else:
+        add("| Severity | Code | Target | Status |")
+        add("|---|---|---|---|")
+        pairs = sorted(
+            zip(report.issues, statuses),
+            key=lambda pair: (SEVERITY_RANK.get(pair[0].severity, 9),
+                              pair[0].code, str(pair[0].target_id)),
+        )
+        for issue, status in pairs:
+            row, column = _issue_target_ids(issue.to_dict())
+            if row is not None and column is not None:
+                target = f"{short(row)} | {short(column)}"
+            elif row is not None:
+                target = short(row)
+            elif column is not None:
+                target = short(column)
+            else:
+                target = short(issue.target_id) or "-"
+            add(f"| {issue.severity} | `{issue.code}` | {target} | {status} |")
+    if notes:
+        add("")
+        add("## Skipped decisions")
+        add("")
+        for note in notes:
+            add(f"- {note}")
+    add("")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def run_clean(args: argparse.Namespace) -> int:
+    matrix_path = Path(args.input)
+    if not matrix_path.is_file():
+        _fail(f"input file not found: {args.input}")
+    report_path = (Path(args.report) if args.report
+                   else matrix_path.parent / "validation_report.json")
+    if not report_path.is_file():
+        _fail(f"validation report not found: {report_path} "
+              "(run 'validate' first, or pass --report)")
+
+    with open(report_path, encoding="utf-8") as fh:
+        stage1 = json.load(fh)
+    issues = stage1.get("issues", [])
+    pending = [i for i in issues if i.get("severity") in (ERROR, WARNING)]
+    info_count = len(issues) - len(pending)
+
+    matrix = pd.read_csv(matrix_path, index_col=0)
+    if matrix.empty:
+        _fail("matrix is empty")
+    matrix.index = matrix.index.astype(str)
+    matrix.columns = matrix.columns.astype(str)
+
+    outdir = Path(args.outdir) if args.outdir else matrix_path.parent
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if args.decisions:
+        decisions_path = Path(args.decisions)
+        if not decisions_path.is_file():
+            _fail(f"decisions file not found: {args.decisions}")
+        decisions = load_decisions_file(decisions_path, matrix_path)
+        _validate_decision_list(decisions)
+        saved_decisions_path = outdir / "decisions.json"
+        if decisions_path.resolve() != saved_decisions_path.resolve():
+            shutil.copyfile(decisions_path, saved_decisions_path)
+    else:
+        print("Stage 2 (clean) - interactive session")
+        print(f"  Matrix: {matrix_path} "
+              f"({matrix.shape[0]} samples x {matrix.shape[1]} features)")
+        print(f"  Issues: {len(pending)} to review"
+              + (f" (+{info_count} informational, no action needed)"
+                 if info_count else ""))
+        print()
+        try:
+            decisions = interactive_clean_session(matrix, pending)
+        except KeyboardInterrupt:
+            print("\nAborted - no changes were applied.")
+            return 1
+        saved_decisions_path = outdir / "decisions.json"
+        write_decisions_file(saved_decisions_path, matrix_path, decisions)
+        print(f"\nDecisions saved to: {saved_decisions_path} (saved before applying)")
+
+    clean, changes, notes = apply_decisions(matrix, decisions)
+
+    matrix_clean_path = outdir / "matrix_clean.csv"
+    out = clean.copy()
+    out.index.name = out.index.name or "sample_id"
+    out.to_csv(matrix_clean_path, index=True, float_format="%.10g")
+
+    change_log_path = outdir / "change_log.json"
+    with open(change_log_path, "w", encoding="utf-8") as fh:
+        json.dump(changes, fh, indent=2)
+        fh.write("\n")
+
+    if clean.shape[0] == 0 or clean.shape[1] == 0:
+        print("Warning: cleaning removed every sample or feature; "
+              "the cleaned matrix is empty.")
+
+    postclean_path = outdir / "postclean_report.md"
+    postclean = _postclean_validation(clean, matrix_clean_path,
+                                      metadata=args.metadata,
+                                      metadata_id_col=args.metadata_id_col)
+    kept_keys = {_decision_key(d) for d in decisions if d.get("action") == "keep"}
+    ignored_keys = {_decision_key(d) for d in decisions if d.get("action") == "ignore"}
+    statuses = []
+    for issue in postclean.issues:
+        key = _issue_key(issue.to_dict())
+        if key in kept_keys:
+            statuses.append("kept (accepted)")
+        elif key in ignored_keys:
+            statuses.append("ignored (pending)")
+        else:
+            statuses.append("remaining")
+
+    decision_counts = {
+        "total": len(decisions),
+        "kept": sum(1 for d in decisions if d.get("action") == "keep"),
+        "ignored": sum(1 for d in decisions if d.get("action") == "ignore"),
+    }
+    write_postclean_markdown(
+        postclean_path, postclean, statuses, decision_counts,
+        len(changes), notes, stage1.get("matrix", {}),
+    )
+
+    counts = postclean.issue_summary()["by_severity"]
+    print("Stage 2 (clean) summary")
+    print(f"  Matrix:      {matrix_path.name} -> {matrix_clean_path.name}")
+    print(f"  Decisions:   {decision_counts['total']} "
+          f"({decision_counts['kept']} kept, {decision_counts['ignored']} ignored, "
+          f"{decision_counts['total'] - decision_counts['kept'] - decision_counts['ignored']} action(s))")
+    if notes:
+        print(f"  Skipped:     {len(notes)} decision(s) could not be applied (see report)")
+    print(f"  Postclean:   {counts[ERROR]} error(s), {counts[WARNING]} warning(s), "
+          f"{counts[INFO]} info")
+    print("Outputs:")
+    print(f"  Matrix:     {matrix_clean_path}")
+    print(f"  Decisions:  {saved_decisions_path}")
+    print(f"  Change log: {change_log_path}")
+    print(f"  Report:     {postclean_path}")
+    print("Next step: run Stage 3 ('rarefy') on the cleaned matrix.")
+    return 0
+
+
+###############################################################################
+# 9. CLI
 ###############################################################################
 
 
@@ -930,8 +1706,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="module1.py",
         description=("TaxInd module 1: import, validation, cleaning and rarefaction "
-                     "of diversity matrices. Stage 1 (validate) is implemented; "
-                     "stages 2-4 are planned (see docs/plan_module1.md)."),
+                     "of diversity matrices. Stages 1 (validate) and 2 (clean) are "
+                     "implemented; stages 3-4 are planned (see docs/plan_module1.md)."),
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
@@ -987,11 +1763,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--metadata-id-col", type=int, default=0,
         help="0-based column of the metadata table holding sample IDs (default: 0).",
     )
+
+    clean = subparsers.add_parser(
+        "clean",
+        help="Stage 2: review issues and correct the matrix "
+             "(interactive, or replay a decisions file).",
+    )
+    clean.add_argument(
+        "-i", "--input", required=True,
+        help="Matrix to clean (matrix_step1.csv from Stage 1).",
+    )
+    clean.add_argument(
+        "-o", "--outdir", default=None,
+        help="Output directory (default: directory of the input matrix).",
+    )
+    clean.add_argument(
+        "--report", default=None,
+        help="Stage 1 validation report "
+             "(default: validation_report.json next to the input matrix).",
+    )
+    clean.add_argument(
+        "--decisions", default=None,
+        help="Decisions file to replay non-interactively (generated by a "
+             "previous interactive session).",
+    )
+    clean.add_argument(
+        "--metadata", default=None,
+        help="Metadata table to repeat the sample-name cross-check.",
+    )
+    clean.add_argument(
+        "--metadata-id-col", type=int, default=0,
+        help="0-based column of the metadata table holding sample IDs (default: 0).",
+    )
     return parser
 
 
 ###############################################################################
-# 9. Stage 1 driver
+# 10. Stage 1 driver
 ###############################################################################
 
 
@@ -1183,7 +1991,7 @@ def run_validate(args: argparse.Namespace) -> int:
 
 
 ###############################################################################
-# 10. Run Main
+# 11. Run Main
 ###############################################################################
 
 
@@ -1191,7 +1999,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "validate":
         sys.exit(run_validate(args))
-    # Future stages: clean (Stage 2), rarefy (Stage 3), run (Stage 4).
+    if args.command == "clean":
+        sys.exit(run_clean(args))
+    # Future stages: rarefy (Stage 3), run (Stage 4).
     build_parser().error(f"unknown command: {args.command}")
 
 
